@@ -161,6 +161,44 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         this.observerMasterPort = observerMasterPort;
     }
 
+    public static final String CONFIG_KEY_MULTI_ADDRESS_ENABLED = "zookeeper.multiAddress.enabled";
+    public static final String CONFIG_DEFAULT_MULTI_ADDRESS_ENABLED = "false";
+
+    private boolean multiAddressEnabled = true;
+    public boolean isMultiAddressEnabled() {
+        return multiAddressEnabled;
+    }
+
+    public void setMultiAddressEnabled(boolean multiAddressEnabled) {
+        this.multiAddressEnabled = multiAddressEnabled;
+        LOG.info("multiAddress.enabled set to {}", multiAddressEnabled);
+    }
+
+    public static final String CONFIG_KEY_MULTI_ADDRESS_REACHABILITY_CHECK_TIMEOUT_MS = "zookeeper.multiAddress.reachabilityCheckTimeoutMs";
+
+    private int multiAddressReachabilityCheckTimeoutMs = (int) MultipleAddresses.DEFAULT_TIMEOUT.toMillis();
+    public int getMultiAddressReachabilityCheckTimeoutMs() {
+        return multiAddressReachabilityCheckTimeoutMs;
+    }
+
+    public void setMultiAddressReachabilityCheckTimeoutMs(int multiAddressReachabilityCheckTimeoutMs) {
+        this.multiAddressReachabilityCheckTimeoutMs = multiAddressReachabilityCheckTimeoutMs;
+        LOG.info("multiAddress.reachabilityCheckTimeoutMs set to {}", multiAddressReachabilityCheckTimeoutMs);
+    }
+
+    public static final String CONFIG_KEY_MULTI_ADDRESS_REACHABILITY_CHECK_ENABLED = "zookeeper.multiAddress.reachabilityCheckEnabled";
+
+    private boolean multiAddressReachabilityCheckEnabled = true;
+
+    public boolean isMultiAddressReachabilityCheckEnabled() {
+        return multiAddressReachabilityCheckEnabled;
+    }
+
+    public void setMultiAddressReachabilityCheckEnabled(boolean multiAddressReachabilityCheckEnabled) {
+        this.multiAddressReachabilityCheckEnabled = multiAddressReachabilityCheckEnabled;
+        LOG.info("multiAddress.reachabilityCheckEnabled set to {}", multiAddressReachabilityCheckEnabled);
+    }
+
     public static class QuorumServer {
 
         public MultipleAddresses addr = new MultipleAddresses();
@@ -250,6 +288,12 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                 } catch (NumberFormatException e) {
                     throw new ConfigException("Address unresolved: " + hostname + ":" + clientParts[clientParts.length - 1]);
                 }
+            }
+
+            boolean multiAddressEnabled = Boolean.parseBoolean(
+                System.getProperty(QuorumPeer.CONFIG_KEY_MULTI_ADDRESS_ENABLED, QuorumPeer.CONFIG_DEFAULT_MULTI_ADDRESS_ENABLED));
+            if (!multiAddressEnabled && serverAddresses.length > 1) {
+                throw new ConfigException("Multiple address feature is disabled, but multiple addresses were specified for sid " + sid);
             }
 
             for (String serverAddress : serverAddresses) {
@@ -959,6 +1003,8 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     AdminServer adminServer;
 
+    private final boolean reconfigEnabled;
+
     public static QuorumPeer testingQuorumPeer() throws SaslException {
         return new QuorumPeer();
     }
@@ -970,6 +1016,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         adminServer = AdminServerFactory.createAdminServer();
         x509Util = createX509Util();
         initialize();
+        reconfigEnabled = QuorumPeerConfig.isReconfigEnabled();
     }
 
     // VisibleForTesting
@@ -1227,11 +1274,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         //TODO: use a factory rather than a switch
         switch (electionAlgorithm) {
         case 1:
-            le = new AuthFastLeaderElection(this);
-            break;
+            throw new UnsupportedOperationException("Election Algorithm 1 is not supported.");
         case 2:
-            le = new AuthFastLeaderElection(this, true);
-            break;
+            throw new UnsupportedOperationException("Election Algorithm 2 is not supported.");
         case 3:
             QuorumCnxManager qcm = createCnxnManager();
             QuorumCnxManager oldQcm = qcmRef.getAndSet(qcm);
@@ -1762,6 +1807,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     }
 
     public void setLastSeenQuorumVerifier(QuorumVerifier qv, boolean writeToDisk) {
+        if (!isReconfigEnabled()) {
+            LOG.info("Dynamic reconfig is disabled, we don't store the last seen config.");
+            return;
+        }
+
         // If qcm is non-null, we may call qcm.connectOne(), which will take the lock on qcm
         // and then take QV_LOCK.  Take the locks in the same order to ensure that we don't
         // deadlock against other callers of connectOne().  If qcmRef gets set in another
@@ -2111,7 +2161,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     }
 
     public boolean processReconfig(QuorumVerifier qv, Long suggestedLeaderId, Long zxid, boolean restartLE) {
-        if (!QuorumPeerConfig.isReconfigEnabled()) {
+        if (!isReconfigEnabled()) {
             LOG.debug("Reconfig feature is disabled, skip reconfig processing.");
             return false;
         }
@@ -2475,6 +2525,10 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     boolean isLeader(long id) {
         Vote vote = getCurrentVote();
         return vote != null && id == vote.getId();
+    }
+
+    public boolean isReconfigEnabled() {
+        return reconfigEnabled;
     }
 
     @InterfaceAudience.Private

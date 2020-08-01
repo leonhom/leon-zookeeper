@@ -38,6 +38,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLSocket;
 import org.apache.jute.BinaryInputArchive;
@@ -46,10 +47,12 @@ import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
 import org.apache.jute.Record;
 import org.apache.zookeeper.ZooDefs.OpCode;
+import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.common.X509Exception;
 import org.apache.zookeeper.server.ExitCode;
 import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ServerCnxn;
+import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.TxnLogEntry;
 import org.apache.zookeeper.server.ZooTrace;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
@@ -86,6 +89,7 @@ public class Learner {
 
     protected Socket sock;
     protected MultipleAddresses leaderAddr;
+    protected AtomicBoolean sockBeingClosed = new AtomicBoolean(false);
 
     /**
      * Socket getter
@@ -95,6 +99,7 @@ public class Learner {
         return sock;
     }
 
+    LearnerSender sender = null;
     protected InputArchive leaderIs;
     protected OutputArchive leaderOs;
     /** the protocol version of the leader */
@@ -113,9 +118,16 @@ public class Learner {
 
     private static final boolean nodelay = System.getProperty("follower.nodelay", "true").equals("true");
 
+    public static final String LEARNER_ASYNC_SENDING = "learner.asyncSending";
+    private static boolean asyncSending = Boolean.getBoolean(LEARNER_ASYNC_SENDING);
+    public static final String LEARNER_CLOSE_SOCKET_ASYNC = "learner.closeSocketAsync";
+    public static final boolean closeSocketAsync = Boolean.getBoolean(LEARNER_CLOSE_SOCKET_ASYNC);
+
     static {
         LOG.info("leaderConnectDelayDuringRetryMs: {}", leaderConnectDelayDuringRetryMs);
         LOG.info("TCP NoDelay set to: {}", nodelay);
+        LOG.info("{} = {}", LEARNER_ASYNC_SENDING, asyncSending);
+        LOG.info("{} = {}", LEARNER_CLOSE_SOCKET_ASYNC, closeSocketAsync);
     }
 
     final ConcurrentHashMap<Long, ServerCnxn> pendingRevalidations = new ConcurrentHashMap<Long, ServerCnxn>();
@@ -124,6 +136,15 @@ public class Learner {
         return pendingRevalidations.size();
     }
 
+    // for testing
+    protected static void setAsyncSending(boolean newMode) {
+        asyncSending = newMode;
+        LOG.info("{} = {}", LEARNER_ASYNC_SENDING, asyncSending);
+
+    }
+    protected static boolean getAsyncSending() {
+        return asyncSending;
+    }
     /**
      * validate a session for a client
      *
@@ -152,13 +173,27 @@ public class Learner {
     }
 
     /**
-     * write a packet to the leader
+     * write a packet to the leader.
+     *
+     * This method is called by multiple threads. We need to make sure that only one thread is writing to leaderOs at a time.
+     * When packets are sent synchronously, writing is done within a synchronization block.
+     * When packets are sent asynchronously, sender.queuePacket() is called, which writes to a BlockingQueue, which is thread-safe.
+     * Reading from this BlockingQueue and writing to leaderOs is the learner sender thread only.
+     * So we have only one thread writing to leaderOs at a time in either case.
      *
      * @param pp
      *                the proposal packet to be sent to the leader
      * @throws IOException
      */
     void writePacket(QuorumPacket pp, boolean flush) throws IOException {
+        if (asyncSending) {
+            sender.queuePacket(pp);
+        } else {
+            writePacketNow(pp, flush);
+        }
+    }
+
+    void writePacketNow(QuorumPacket pp, boolean flush) throws IOException {
         synchronized (leaderOs) {
             if (pp != null) {
                 messageTracker.trackSent(pp.getType());
@@ -168,6 +203,14 @@ public class Learner {
                 bufferedOutput.flush();
             }
         }
+    }
+
+    /**
+     * Start thread that will forward any packet in the queue to the leader
+     */
+    protected void startSendingThread() {
+        sender = new LearnerSender(this);
+        sender.start();
     }
 
     /**
@@ -182,11 +225,11 @@ public class Learner {
             leaderIs.readRecord(pp, "packet");
             messageTracker.trackReceived(pp.getType());
         }
-        long traceMask = ZooTrace.SERVER_PACKET_TRACE_MASK;
-        if (pp.getType() == Leader.PING) {
-            traceMask = ZooTrace.SERVER_PING_TRACE_MASK;
-        }
         if (LOG.isTraceEnabled()) {
+            final long traceMask =
+                (pp.getType() == Leader.PING) ? ZooTrace.SERVER_PING_TRACE_MASK
+                    : ZooTrace.SERVER_PACKET_TRACE_MASK;
+
             ZooTrace.logQuorumPacket(LOG, traceMask, 'i', pp);
         }
     }
@@ -199,6 +242,10 @@ public class Learner {
      * @throws IOException
      */
     void request(Request request) throws IOException {
+        if (request.isThrottled()) {
+            LOG.error("Throttled request sent to leader: {}. Exiting", request);
+            ServiceUtils.requestSystemExit(ExitCode.UNEXPECTED_ERROR.getValue());
+        }
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         DataOutputStream oa = new DataOutputStream(baos);
         oa.writeLong(request.sessionId);
@@ -266,7 +313,14 @@ public class Learner {
     protected void connectToLeader(MultipleAddresses multiAddr, String hostname) throws IOException {
 
         this.leaderAddr = multiAddr;
-        Set<InetSocketAddress> addresses = multiAddr.getAllReachableAddresses();
+        Set<InetSocketAddress> addresses;
+        if (self.isMultiAddressReachabilityCheckEnabled()) {
+            // even if none of the addresses are reachable, we want to try to establish connection
+            // see ZOOKEEPER-3758
+            addresses = multiAddr.getAllReachableAddressesOrAll();
+        } else {
+            addresses = multiAddr.getAllAddresses();
+        }
         ExecutorService executor = Executors.newFixedThreadPool(addresses.size());
         CountDownLatch latch = new CountDownLatch(addresses.size());
         AtomicReference<Socket> socket = new AtomicReference<>(null);
@@ -291,6 +345,7 @@ public class Learner {
             throw new IOException("Failed connect to " + multiAddr);
         } else {
             sock = socket.get();
+            sockBeingClosed.set(false);
         }
 
         self.authLearner.authenticate(sock, hostname);
@@ -298,6 +353,9 @@ public class Learner {
         leaderIs = BinaryInputArchive.getArchive(new BufferedInputStream(sock.getInputStream()));
         bufferedOutput = new BufferedOutputStream(sock.getOutputStream());
         leaderOs = BinaryOutputArchive.getArchive(bufferedOutput);
+        if (asyncSending) {
+            startSendingThread();
+        }
     }
 
     class LeaderConnector implements Runnable {
@@ -513,7 +571,7 @@ public class Learner {
                 // ZOOKEEPER-2819: overwrite config node content extracted
                 // from leader snapshot with local config, to avoid potential
                 // inconsistency of config node content during rolling restart.
-                if (!QuorumPeerConfig.isReconfigEnabled()) {
+                if (!self.isReconfigEnabled()) {
                     LOG.debug("Reset config node content from local config after deserialization of snapshot.");
                     zk.getZKDatabase().initConfigInZKDatabase(self.getQuorumVerifier());
                 }
@@ -769,8 +827,9 @@ public class Learner {
             dos.writeLong(entry.getKey());
             dos.writeInt(entry.getValue());
         }
-        qp.setData(bos.toByteArray());
-        writePacket(qp, true);
+
+        QuorumPacket pingReply = new QuorumPacket(qp.getType(), qp.getZxid(), bos.toByteArray(), qp.getAuthinfo());
+        writePacket(pingReply, true);
     }
 
     /**
@@ -780,6 +839,11 @@ public class Learner {
         self.setZooKeeperServer(null);
         self.closeAllConnections();
         self.adminServer.setZooKeeperServer(null);
+
+        if (sender != null) {
+            sender.shutdown();
+        }
+
         closeSocket();
         // shutdown previous zookeeper
         if (zk != null) {
@@ -792,10 +856,27 @@ public class Learner {
     }
 
     void closeSocket() {
+        if (sock != null) {
+            if (sockBeingClosed.compareAndSet(false, true)) {
+                if (closeSocketAsync) {
+                    final Thread closingThread = new Thread(() -> closeSockSync(), "CloseSocketThread(sid:" + zk.getServerId());
+                    closingThread.setDaemon(true);
+                    closingThread.start();
+                } else {
+                    closeSockSync();
+                }
+            }
+        }
+    }
+
+    void closeSockSync() {
         try {
+            long startTime = Time.currentElapsedTime();
             if (sock != null) {
                 sock.close();
+                sock = null;
             }
+            ServerMetrics.getMetrics().SOCKET_CLOSING_TIME.add(Time.currentElapsedTime() - startTime);
         } catch (IOException e) {
             LOG.warn("Ignoring error closing connection to leader", e);
         }
